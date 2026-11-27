@@ -25,6 +25,8 @@ At minimum you need to set `apikey` to your Abusix Mail Intelligence API key.  I
 
 If you are using a non-local Redis server, then you will need to uncomment the `[redis]` section and set-up the connection parameters accordingly.
 
+The daemon listens on `listen_host`:`listen_port`, which default to `127.0.0.1` and `9998`. Only change `listen_host` if Postfix runs on a different host, and then restrict access to the port (see Security). The daemon logs the address it listens on at start-up.
+
 Run `./abusix_auth_ppd.js` to ensure that the daemon starts and there are no errors, press Ctrl+C to terminate it, then run:
 
 `sudo systemctl start abusix_auth_ppd`
@@ -45,7 +47,7 @@ Example:
 smtpd_sender_restrictions = reject_unauth_destination, check_policy_service inet:127.0.0.1:9998
 ````
 
-If you are running the policy daemon on a separate server to Postfix, then will need to modify the IP address accordingly.
+If you are running the policy daemon on a separate server to Postfix, then you will need to set `listen_host` on the daemon and modify the IP address accordingly (see Security).
 
 Postfix needs to be restarted once `main.cf` has been edited.
 
@@ -68,6 +70,31 @@ And to delete an entry from the cache once the compromised account has been secu
 `echo "SREM compromised_accts add@ress.com" | redis-cli --raw`
 
 Redis should return "1" to say that it removed one item from the set and messages will be allowed through from this account again.
+
+## Security
+
+Anyone who can connect to the policy port can send it made-up SMTP transaction attributes. The daemon looks them up with your Abusix Mail Intelligence API key, can add any username to the compromised-accounts cache (so that account's mail is then rejected or held), and runs `command`, if set, with those attributes. Keep the port reachable by Postfix only:
+
+- Leave `listen_host` at its default `127.0.0.1` (or `::1`) when Postfix runs on the same host, which is the normal setup.
+- If Postfix runs on another host, set `listen_host` to a private address and use a firewall so that only the Postfix host can reach `listen_port`.
+- Never expose the policy port to the internet.
+
+Versions before `listen_host` was added listen on all interfaces; if you run one, block `listen_port` from all hosts except Postfix with a firewall, or update.
+
+## Local development
+
+Tests use the built-in Node.js test runner (Node.js >= 18). They start the daemon against a temporary configuration, with DNS lookups and Redis stubbed, so they need neither an API key nor a Redis server:
+
+```sh
+npm install
+npm test
+```
+
+Run the daemon in the foreground with debug logging by setting `DEBUG=1`:
+
+```sh
+DEBUG=1 ./abusix_auth_ppd.js
+```
 
 ## License
 This software is licensed under the GPLv3, please see the `COPYING` file in the same directory.   Please send any modifications or improvements as a Pull Request.
