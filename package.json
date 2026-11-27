@@ -4,7 +4,7 @@
   "description": "Abusix Authentication Postfix Policy Daemon",
   "main": "abusix_auth_ppd.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test test/daemon.test.js"
   },
   "author": "Steve Freegard <steve.freegard@abusix.com>",
   "license": "GPLv3",

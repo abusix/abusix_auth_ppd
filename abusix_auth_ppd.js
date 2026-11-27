@@ -46,6 +46,15 @@ catch (e) {
     process.exit(1);
 }
 
+// Address the policy server binds to. Postfix normally runs on the same host,
+// so only listen on loopback unless the operator explicitly configures otherwise.
+const listen_host = (cfg.listen_host && String(cfg.listen_host).trim()) || '127.0.0.1';
+const listen_port = cfg.listen_port || 9998;
+
+// Delay before replacing a worker that exited, so a worker that keeps crashing
+// does not turn into a tight fork loop.
+const REFORK_DELAY_MS = 1000;
+
 // Common functions
 const debug = (text) => {
     if (DEBUG) console.error(`DEBUG: ${text}`);
@@ -134,6 +143,13 @@ if (cluster.isMaster) {
         }
     })();
 
+    var listening_logged = false;
+    cluster.on('listening', (worker, address) => {
+        if (listening_logged) return;
+        listening_logged = true;
+        console.log(`listening on ${address.address}:${address.port}`);
+    });
+
     cluster.on('online', (worker) => {
         if (DEBUG) console.log(`worker ${worker.id} online with PID ${worker.process.pid}`);
     });
@@ -145,7 +161,7 @@ if (cluster.isMaster) {
         }
         else {
             console.log(`worker ${worker.id} with PID ${worker.process.pid} died (code: ${code}, signal: ${signal})`);
-            cluster.fork();
+            setTimeout(() => cluster.fork(), REFORK_DELAY_MS);
         }
     });
 
@@ -196,8 +212,19 @@ const server = net.createServer(async (client) => {
         else {
             // Ignore as we get a blank entry on disconnect
             if (!Object.keys(attrs).length) return;
-            // EOD
-            await this.process_data(attrs, client);
+            // EOD: hand this request's attributes over and start a new set,
+            // as Postfix may send further requests on the same connection
+            const request = attrs;
+            attrs = {};
+            try {
+                await this.process_data(request, client);
+            }
+            catch (err) {
+                // Never let a bad request take the worker down; tell Postfix
+                // to carry on instead
+                console.error(`[${request?.instance || null}] error processing request: ${err?.message}`);
+                if (client.writable) client.write('action=DUNNO\n\n', 'ascii');
+            }
         }
     });
 
@@ -248,20 +275,20 @@ exports.process_data = async (attrs, client) => {
                 });
             }
         }
-        switch (cfg.action.toLowerCase()) {
+        switch ((cfg.action || 'log').toLowerCase()) {
             case 'reject':
-                client.write('action=REJECT\n\n', { encoding: 'ascii' });
+                client.write('action=REJECT\n\n', 'ascii');
                 break;
             case 'hold':
-                client.write('action=HOLD\n\n', { encoding: 'ascii' });
+                client.write('action=HOLD\n\n', 'ascii');
                 break;
             case 'log':
                 // We always log anyway, so just skip this
-                client.write('action=DUNNO\n\n', { encoding: 'ascii' });
+                client.write('action=DUNNO\n\n', 'ascii');
                 break;
             default:
                 console.log(`[${attrs.instance || null}] ip=${attrs.client_address} username=${attrs.sasl_username} Error: unknown action ${cfg.action}; logging only!`);
-                client.write('action=DUNNO\n\n', { encoding: 'ascii' });
+                client.write('action=DUNNO\n\n', 'ascii');
         }
     }
 
@@ -270,7 +297,7 @@ exports.process_data = async (attrs, client) => {
     // We are only interested in AUTHenticated sessions
     if (!(attrs?.sasl_method && attrs?.sasl_username)) {
         debug(`[${attrs?.instance || null }] ip=${attrs?.client_address} skipping as non-authenticated connection`);
-        return client.write('action=DUNNO\n\n', { encoding: 'ascii' });
+        return client.write('action=DUNNO\n\n', 'ascii');
     }
 
     // Lowercase the username
@@ -313,7 +340,7 @@ exports.process_data = async (attrs, client) => {
     }
 
     // If we get here, we didn't find anything, so tell Postfix to continue
-    client.write('action=DUNNO\n\n', { encoding: 'ascii' });
+    client.write('action=DUNNO\n\n', 'ascii');
 }
 
 // Main async block
@@ -322,7 +349,7 @@ exports.process_data = async (attrs, client) => {
     debug(`redis client connected`);
 
     // Start server
-    server.listen(cfg.listen_port || 9998, () => {
+    server.listen(listen_port, listen_host, () => {
         debug(`opened server: ${JSON.stringify(server.address())}`);
         started = true;
     });
