@@ -188,3 +188,69 @@ test('several requests on one connection each get a reply', async (t) => {
     assert.deepStrictEqual(replies, ['action=REJECT\n\n', 'action=DUNNO\n\n']);
     await assertNoWorkerDied(d);
 });
+
+// A command script that writes the environment it was started with to a file
+function envDumpCommand(t) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'abusix_auth_ppd-cmd-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const out = path.join(dir, 'env.txt');
+    const script = path.join(dir, 'dump_env.sh');
+    fs.writeFileSync(script, `#!/bin/sh\n/usr/bin/env > '${out}'\n`, { mode: 0o755 });
+    return {
+        config: `command=${script}`,
+        // Resolves with the dumped environment as an object, or null if the
+        // command did not run within the time limit
+        read: async (ms = 2000) => {
+            const deadline = Date.now() + ms;
+            while (Date.now() < deadline) {
+                if (fs.existsSync(out)) {
+                    await new Promise((r) => setTimeout(r, 50));
+                    return Object.fromEntries(fs.readFileSync(out, 'utf8').split('\n').filter(Boolean)
+                        .map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+                }
+                await new Promise((r) => setTimeout(r, 50));
+            }
+            return null;
+        },
+    };
+}
+
+// Postfix forwards these inside a quoted local part of the envelope sender
+// unchanged; only "\n" ends an attribute line in the policy protocol
+for (const [name, sep] of Object.entries({
+    'U+2028': ' ', 'U+2029': ' ', 'U+0085': '\u0085', 'vertical tab': '\v', 'form feed': '\f', 'carriage return': '\r',
+})) {
+    test(`a sender containing ${name} cannot add attributes to the request`, async (t) => {
+        const cmd = envDumpCommand(t);
+        const d = await startDaemon(t, { config: ['action=reject', cmd.config], env: { STUB_LISTED_IP: '192.0.2.1' } });
+        const { sasl_method, sasl_username, ...attrs } = AUTH_REQUEST;
+        const sender = `"x${sep}sasl_method=PLAIN${sep}sasl_username=victim@corp.example${sep}"@example.org`;
+        assert.strictEqual(await policyRequest(d.port, { ...attrs, sender }), 'action=DUNNO\n\n');
+        assert.strictEqual(await cmd.read(500), null, 'command must not run');
+        assert.doesNotMatch(d.output(), /victim@corp\.example/);
+        await assertNoWorkerDied(d);
+    });
+}
+
+test('command gets only Postfix attributes and a fixed PATH', async (t) => {
+    const cmd = envDumpCommand(t);
+    const d = await startDaemon(t, { config: ['action=reject', cmd.config], env: { STUB_LISTED_IP: '192.0.2.1' } });
+    const reply = await policyRequest(d.port, {
+        ...AUTH_REQUEST,
+        'BASH_FUNC_mail%%': '() { id; }',
+        PATH: '/tmp/evil',
+        LD_PRELOAD: '/tmp/evil.so',
+        BASH_ENV: '/tmp/evil.sh',
+    });
+    assert.strictEqual(reply, 'action=REJECT\n\n');
+    const env = await cmd.read();
+    assert.ok(env, 'command must run');
+    assert.strictEqual(env.sasl_username, 'user@example.org');
+    assert.strictEqual(env.client_address, '192.0.2.1');
+    assert.strictEqual(env.sender, 'user@example.org');
+    assert.strictEqual(env.PATH, '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin');
+    for (const name of ['BASH_FUNC_mail%%', 'LD_PRELOAD', 'BASH_ENV']) {
+        assert.ok(!(name in env), `${name} must not reach the command`);
+    }
+    await assertNoWorkerDied(d);
+});

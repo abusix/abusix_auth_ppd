@@ -24,7 +24,6 @@ const cluster = require('cluster');
 const numCPUs = require('os').cpus().length;
 const net = require('net');
 const crypto = require('crypto');
-const byline = require('byline');
 const fs = require('fs');
 const path = require('path');
 const child_process = require('child_process');
@@ -54,6 +53,17 @@ const listen_port = cfg.listen_port || 9998;
 // Delay before replacing a worker that exited, so a worker that keeps crashing
 // does not turn into a tight fork loop.
 const REFORK_DELAY_MS = 1000;
+
+// Postfix attribute names are lower case (client_address, sasl_username, ...).
+// Anything else is ignored, so a request can't set variables such as PATH,
+// LD_PRELOAD or BASH_FUNC_* in the environment of the configured command.
+const ATTR_NAME = /^[a-z][a-z0-9_]*$/;
+
+// The command gets this PATH instead of anything from the request
+const COMMAND_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+
+// Longest line we accept before dropping the connection
+const MAX_LINE_LENGTH = 64 * 1024;
 
 // Common functions
 const debug = (text) => {
@@ -196,21 +206,22 @@ redis.on('error', (err) => {
 const server = net.createServer(async (client) => {
     debug(`client connected: ${client.remoteAddress}:${client.remotePort}`);
 
-    const bl = byline(client, { keepEmptyLines: true });
-
     var attrs = {};
 
-    bl.on('data', async (line) => {
-        line = line.toString('ascii');
+    const handle_line = async (line) => {
         if (line !== '') {
             // Store attributes
             var pos = line.indexOf('=');
             var lhs = line.substr(0,pos);
             var rhs = line.substr(pos+1);
+            if (pos < 1 || !ATTR_NAME.test(lhs)) {
+                debug(`ignoring attribute line with an invalid name: ${JSON.stringify(lhs)}`);
+                return;
+            }
             attrs[lhs] = rhs;
         }
         else {
-            // Ignore as we get a blank entry on disconnect
+            // Ignore an empty request
             if (!Object.keys(attrs).length) return;
             // EOD: hand this request's attributes over and start a new set,
             // as Postfix may send further requests on the same connection
@@ -225,6 +236,27 @@ const server = net.createServer(async (client) => {
                 console.error(`[${request?.instance || null}] error processing request: ${err?.message}`);
                 if (client.writable) client.write('action=DUNNO\n\n', 'ascii');
             }
+        }
+    };
+
+    // The policy protocol ends every line with "\n" and nothing else. Don't
+    // split on other line breaks: Postfix passes the envelope sender through
+    // unchanged, and a quoted local part may contain \r, \v, \f, U+0085,
+    // U+2028 or U+2029. Splitting there would let a remote sender add
+    // attributes of its choosing to the request.
+    client.setEncoding('utf8');
+    let buf = '';
+    client.on('data', (chunk) => {
+        buf += chunk;
+        let nl;
+        while ((nl = buf.indexOf('\n')) !== -1) {
+            const line = buf.slice(0, nl);
+            buf = buf.slice(nl + 1);
+            handle_line(line);
+        }
+        if (buf.length > MAX_LINE_LENGTH) {
+            console.error(`client ${client.remoteAddress}:${client.remotePort} sent a line longer than ${MAX_LINE_LENGTH} bytes; closing the connection`);
+            client.destroy();
         }
     });
 
@@ -263,8 +295,8 @@ exports.process_data = async (attrs, client) => {
             // Run command if specified
             if (cfg.command) {
                 child_process.exec(cfg.command, {
-                    // Pass in all attributes as shell variables
-                    env: attrs
+                    // Pass the attributes in as shell variables, with a fixed PATH
+                    env: { ...attrs, PATH: COMMAND_PATH }
                 }, (err, stdout, stderr) => {
                     if (err) {
                         return console.log(`[${attrs.instance || null}] command "${cfg.command}" returned error: ${err.message.replace(/\r?\n/, ' ').trim()}`);
