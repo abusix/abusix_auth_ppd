@@ -81,6 +81,10 @@ Anyone who can connect to the policy port can send it made-up SMTP transaction a
 
 Versions before `listen_host` was added listen on all interfaces; if you run one, block `listen_port` from all hosts except Postfix with a firewall, or update.
 
+The `command` gets the request's attributes as environment variables, but only those with lower-case Postfix-style names (such as `sasl_username` or `client_address`), and a fixed `PATH` (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`). Values such as `sender`, `recipient` and `helo_name` come from the remote SMTP client, so treat them as untrusted in your script: quote them, and never pass them to `eval` or use them to build commands.
+
+Versions before this change split request lines on more than `\n` and passed every attribute name to `command`. A remote sender could use a crafted envelope sender to add attributes, add any username to the compromised-accounts cache, and, if `command` is set and `/bin/sh` is bash, run code as the daemon's user. If you run an older version, update. If you can't update right away, comment out `command` and remove unexpected entries from the `compromised_accts` set in Redis.
+
 ## Local development
 
 Tests use the built-in Node.js test runner (Node.js >= 18). They start the daemon against a temporary configuration, with DNS lookups and Redis stubbed, so they need neither an API key nor a Redis server:
